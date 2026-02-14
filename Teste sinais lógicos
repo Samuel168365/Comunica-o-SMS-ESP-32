@@ -1,0 +1,84 @@
+// Entradas digitais no ESP32
+
+const int entrada1 = 5;    // D5
+const int entrada2 = 4;    // D4
+const int entrada3 = 16;   // D16
+const int entrada4 = 17;   // D17
+
+int ultimoCodigoConfirmado = -1;
+int codigoAnteriorLeitura = -1;
+
+unsigned long tempoMudanca = 0;
+const unsigned long tempoEstabilizacao = 150; // ms (ajuste se quiser)
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(entrada1, INPUT_PULLUP);
+  pinMode(entrada2, INPUT_PULLUP);
+  pinMode(entrada3, INPUT_PULLUP);
+  pinMode(entrada4, INPUT_PULLUP);
+
+  Serial.println("Sistema com filtro de estabilidade iniciado");
+}
+
+void loop() {
+
+  int e1 = !digitalRead(entrada1);
+  int e2 = !digitalRead(entrada2);
+  int e3 = !digitalRead(entrada3);
+  int e4 = !digitalRead(entrada4);
+
+  int codigoAtual = (e1 << 3) | (e2 << 2) | (e3 << 1) | e4;
+
+  // Detectou mudança inicial
+  if (codigoAtual != codigoAnteriorLeitura) {
+    tempoMudanca = millis();
+    codigoAnteriorLeitura = codigoAtual;
+  }
+
+  // Só confirma após estabilizar
+  if ((millis() - tempoMudanca) > tempoEstabilizacao) {
+
+    if (codigoAtual != ultimoCodigoConfirmado) {
+
+      Serial.print("Entradas: ");
+      Serial.print(e1); Serial.print(" ");
+      Serial.print(e2); Serial.print(" ");
+      Serial.print(e3); Serial.print(" ");
+      Serial.print(e4); Serial.println();
+
+      Serial.println(tabelaGerador(codigoAtual));
+      Serial.println("--------------------------");
+
+      ultimoCodigoConfirmado = codigoAtual;
+    }
+  }
+}
+
+String tabelaGerador(int codigo) {
+
+  switch(codigo) {
+    case 0b0000: return "Gerador desligado - QTA posicao 0";
+    case 0b0001: return "Gerador desligado - QTA posicao II";
+    case 0b0010: return "Gerador desligado - QTA posicao I";
+    case 0b0011: return "Nao aplicado";
+
+    case 0b0100: return "Gerador em falha - QTA posicao 0";
+    case 0b0101: return "Gerador em falha - QTA posicao II";
+    case 0b0110: return "Gerador em falha - QTA posicao I";
+    case 0b0111: return "Nao aplicado";
+
+    case 0b1000: return "Gerador ligado - QTA posicao 0";
+    case 0b1001: return "Gerador ligado - QTA posicao II";
+    case 0b1010: return "Gerador ligado - QTA posicao I";
+    case 0b1011: return "Nao aplicado";
+
+    case 0b1100: return "Gerador em alerta - QTA posicao 0";
+    case 0b1101: return "Gerador em alerta - QTA posicao II";
+    case 0b1110: return "Gerador em alerta - QTA posicao I";
+    case 0b1111: return "Nao aplicado";
+
+    default: return "Estado desconhecido";
+  }
+}
