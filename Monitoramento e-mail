@@ -1,0 +1,161 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP_Mail_Client.h>
+
+// ===== CONFIGURAÇÃO WIFI =====
+#define WIFI_SSID       "aec10"
+#define WIFI_PASSWORD   "4Tyv!/.s"
+
+// ===== CONFIGURAÇÃO GMAIL =====
+#define SMTP_HOST       "smtp.gmail.com"
+#define SMTP_PORT       587
+#define AUTHOR_EMAIL    "samubtav@gmail.com"
+#define AUTHOR_PASSWORD "hjnxbbkgratwulxq"
+#define RECIPIENT_EMAIL "samuelxd0711@gmail.com"
+
+// ===== PINOS DOS INTERRUPTORES =====
+const int entrada1 = 5;
+const int entrada2 = 4;
+const int entrada3 = 16;
+const int entrada4 = 17;
+
+// ===== PINO RELÉ GERADOR =====
+const int releGerador = 18;
+
+// ===== OBJETO SERVIDOR E SMTP =====
+WebServer server(80);
+SMTPSession smtp;
+
+// ===== VARIÁVEIS =====
+int ultimoCodigo = -1;
+
+// ================= SETUP =================
+void setup() {
+    Serial.begin(115200);
+
+    // Configura entradas e saída
+    pinMode(entrada1, INPUT_PULLUP);
+    pinMode(entrada2, INPUT_PULLUP);
+    pinMode(entrada3, INPUT_PULLUP);
+    pinMode(entrada4, INPUT_PULLUP);
+    pinMode(releGerador, OUTPUT);
+    digitalWrite(releGerador, LOW);
+
+    // Conecta WiFi
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("Conectando ao WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi conectado!");
+    Serial.print("IP do ESP32: ");
+    Serial.println(WiFi.localIP());
+
+    // Rotas do servidor web
+    server.on("/ligar", ligarGerador);
+    server.on("/desligar", desligarGerador);
+    server.begin();
+}
+
+// ================= LOOP =================
+void loop() {
+    server.handleClient();
+
+    // Lê estado dos interruptores
+    int e1 = !digitalRead(entrada1);
+    int e2 = !digitalRead(entrada2);
+    int e3 = !digitalRead(entrada3);
+    int e4 = !digitalRead(entrada4);
+
+    int codigo = (e1 << 3) | (e2 << 2) | (e3 << 1) | e4;
+
+    if (codigo != ultimoCodigo) {
+        delay(300); // Debounce
+        e1 = !digitalRead(entrada1);
+        e2 = !digitalRead(entrada2);
+        e3 = !digitalRead(entrada3);
+        e4 = !digitalRead(entrada4);
+        codigo = (e1 << 3) | (e2 << 2) | (e3 << 1) | e4;
+
+        if (codigo != ultimoCodigo) {
+            String estado = tabelaGerador(codigo);
+            Serial.println("Novo estado detectado:");
+            Serial.println(estado);
+
+            enviarEmail("Status Gerador", estado);
+            ultimoCodigo = codigo;
+        }
+    }
+
+    delay(200);
+}
+
+// ================= TABELA LÓGICA =================
+String tabelaGerador(int codigo) {
+    switch (codigo) {
+        case 0b0000: return "Gerador desligado - QTA posicao 0";
+        case 0b0001: return "Gerador desligado - QTA posicao II";
+        case 0b0010: return "Gerador desligado - QTA posicao I";
+        case 0b0011: return "Nao aplicado";
+        case 0b0100: return "Gerador em falha - QTA posicao 0";
+        case 0b0101: return "Gerador em falha - QTA posicao II";
+        case 0b0110: return "Gerador em falha - QTA posicao I";
+        case 0b0111: return "Nao aplicado";
+        case 0b1000: return "Gerador ligado - QTA posicao 0";
+        case 0b1001: return "Gerador ligado - QTA posicao II";
+        case 0b1010: return "Gerador ligado - QTA posicao I";
+        case 0b1011: return "Nao aplicado";
+        case 0b1100: return "Gerador em alerta - QTA posicao 0";
+        case 0b1101: return "Gerador em alerta - QTA posicao II";
+        case 0b1110: return "Gerador em alerta - QTA posicao I";
+        case 0b1111: return "Nao aplicado";
+        default:     return "Estado desconhecido";
+    }
+}
+
+// ================= COMANDOS WEB =================
+void ligarGerador() {
+    digitalWrite(releGerador, HIGH);
+    server.send(200, "text/plain", "Gerador LIGADO");
+    enviarEmail("Comando Remoto", "Gerador foi LIGADO remotamente");
+}
+
+void desligarGerador() {
+    digitalWrite(releGerador, LOW);
+    server.send(200, "text/plain", "Gerador DESLIGADO");
+    enviarEmail("Comando Remoto", "Gerador foi DESLIGADO remotamente");
+}
+
+// ================= ENVIAR EMAIL =================
+void enviarEmail(String assunto, String corpo) {
+    ESP_Mail_Session session;
+    session.server.host_name = SMTP_HOST;
+    session.server.port = SMTP_PORT;
+    session.login.email = AUTHOR_EMAIL;
+    session.login.password = AUTHOR_PASSWORD;
+    session.login.user_domain = "";
+
+    SMTP_Message message;
+    message.sender.name = "ESP32 Monitor";
+    message.sender.email = AUTHOR_EMAIL;
+    message.subject = assunto;
+    message.addRecipient("Samuel", RECIPIENT_EMAIL);
+    message.text.content = corpo;
+    message.text.charSet = "utf-8";
+    message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+
+    if (!smtp.connect(&session)) {
+        Serial.println("Erro ao conectar SMTP");
+        Serial.println(smtp.errorReason());
+        return;
+    }
+
+    if (!MailClient.sendMail(&smtp, &message)) {
+        Serial.println("Erro ao enviar email: " + smtp.errorReason());
+    } else {
+        Serial.println("Email enviado com sucesso!");
+    }
+
+    smtp.closeSession();
+}
