@@ -1,0 +1,205 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// ==================== WIFI E TELEGRAM ====================
+const char* ssid = "aec10";
+const char* password = "4Tyv!/.s";
+const char* botToken = "8288152844:AAFfMhSKBMunK68JkyogC5nKGL7vVGBhU3w";
+String chatID = "6148205976";
+
+// ==================== NUMERO SMS ====================
+String numeroSMS = "+5535984611220";
+
+// ==================== ENTRADAS ====================
+const int entrada1 = 5;
+const int entrada2 = 4;
+const int entrada3 = 16;
+const int entrada4 = 17;
+
+// ==================== SAIDA ====================
+const int saidaGerador = 18;
+
+// ==================== UART A7600 ====================
+HardwareSerial modem(2); // UART2
+
+// ==================== CONTROLE ====================
+int ultimoCodigoConfirmado = -1;
+int codigoAnteriorLeitura = -1;
+
+unsigned long tempoMudanca = 0;
+const unsigned long tempoEstabilizacao = 300;
+
+bool geradorLigado = false;
+unsigned long tempoInicio = 0;
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(1000);
+
+  // UART modem (RX=26 TX=27)
+  modem.begin(115200, SERIAL_8N1, 26, 27);
+  delay(3000);
+
+  inicializarA7600();
+
+  pinMode(entrada1, INPUT_PULLUP);
+  pinMode(entrada2, INPUT_PULLUP);
+  pinMode(entrada3, INPUT_PULLUP);
+  pinMode(entrada4, INPUT_PULLUP);
+
+  pinMode(saidaGerador, OUTPUT);
+  digitalWrite(saidaGerador, LOW);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nSistema iniciado com SMS + Telegram + Terminal AT");
+}
+
+void loop() {
+
+  // ==================== TERMINAL AT ====================
+  while (Serial.available()) {
+    modem.write(Serial.read());
+  }
+
+  while (modem.available()) {
+    Serial.write(modem.read());
+  }
+
+  // ==================== LEITURA ENTRADAS ====================
+  int e1 = !digitalRead(entrada1);
+  int e2 = !digitalRead(entrada2);
+  int e3 = !digitalRead(entrada3);
+  int e4 = !digitalRead(entrada4);
+
+  int codigoAtual = (e1 << 3) | (e2 << 2) | (e3 << 1) | e4;
+
+  if (codigoAtual != codigoAnteriorLeitura) {
+    tempoMudanca = millis();
+    codigoAnteriorLeitura = codigoAtual;
+  }
+
+  if ((millis() - tempoMudanca) > tempoEstabilizacao) {
+
+    if (codigoAtual != ultimoCodigoConfirmado) {
+
+      String estado = tabelaGerador(codigoAtual);
+
+      Serial.println("\nEstado: " + estado);
+
+      enviarMensagemTelegram(estado);
+      enviarSMS(estado);
+
+      // Controle tempo ligado
+      if (e1 == 1 && !geradorLigado) {
+        geradorLigado = true;
+        tempoInicio = millis();
+      }
+      else if (e1 == 0 && geradorLigado) {
+
+        geradorLigado = false;
+
+        unsigned long tempoLigadoMs = millis() - tempoInicio;
+        unsigned long totalMinutos = tempoLigadoMs / 60000;
+        unsigned long horas = totalMinutos / 60;
+        unsigned long minutos = totalMinutos % 60;
+
+        String mensagemTempo = "Gerador ligado por ";
+        if (horas > 0) mensagemTempo += String(horas) + "h ";
+        mensagemTempo += String(minutos) + "min";
+
+        enviarMensagemTelegram(mensagemTempo);
+        enviarSMS(mensagemTempo);
+      }
+
+      ultimoCodigoConfirmado = codigoAtual;
+    }
+  }
+}
+
+// ==================== INICIALIZA A7600 ====================
+void inicializarA7600() {
+
+  enviarAT("AT");
+  enviarAT("ATE0");
+  enviarAT("AT+CMGF=1");
+  enviarAT("AT+CSCS=\"GSM\"");
+}
+
+// ==================== FUNCAO AT ====================
+void enviarAT(String comando) {
+
+  modem.println(comando);
+  delay(500);
+
+  while (modem.available()) {
+    Serial.write(modem.read());
+  }
+}
+
+// ==================== ENVIO SMS ====================
+void enviarSMS(String mensagem) {
+
+  modem.println("AT+CMGS=\"" + numeroSMS + "\"");
+  delay(500);
+
+  modem.print(mensagem);
+  delay(200);
+
+  modem.write(26); // CTRL+Z
+  delay(5000);
+
+  Serial.println("SMS enviado");
+}
+
+// ==================== TELEGRAM ====================
+void enviarMensagemTelegram(String mensagem) {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + String(botToken) + "/sendMessage";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData = "chat_id=" + chatID + "&text=" + mensagem;
+  http.POST(postData);
+
+  http.end();
+}
+
+// ==================== TABELA ORIGINAL ====================
+String tabelaGerador(int codigo) {
+
+  switch(codigo) {
+
+    case 0b0000: return "Gerador desligado - QTA posicao 0";
+    case 0b0001: return "Gerador desligado - QTA posicao II";
+    case 0b0010: return "Gerador desligado - QTA posicao I";
+    case 0b0011: return "Nao aplicado";
+
+    case 0b0100: return "Gerador em falha - QTA posicao 0";
+    case 0b0101: return "Gerador em falha - QTA posicao II";
+    case 0b0110: return "Gerador em falha - QTA posicao I";
+    case 0b0111: return "Nao aplicado";
+
+    case 0b1000: return "Gerador ligado - QTA posicao 0";
+    case 0b1001: return "Gerador ligado - QTA posicao II";
+    case 0b1010: return "Gerador ligado - QTA posicao I";
+    case 0b1011: return "Nao aplicado";
+
+    case 0b1100: return "Gerador em alerta - QTA posicao 0";
+    case 0b1101: return "Gerador em alerta - QTA posicao II";
+    case 0b1110: return "Gerador em alerta - QTA posicao I";
+    case 0b1111: return "Nao aplicado";
+
+    default: return "Estado desconhecido";
+  }
+}
