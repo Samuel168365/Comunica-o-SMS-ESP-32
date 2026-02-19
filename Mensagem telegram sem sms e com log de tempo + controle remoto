@@ -3,8 +3,8 @@
 #include <ArduinoJson.h>
 
 // ==================== Configuração Wi-Fi e Telegram ====================
-const char* ssid = "M55 de Samuel";
-const char* password = "16836583#";
+const char* ssid = "Aec10";
+const char* password = "4Tyv!/.s";
 const char* botToken = "8288152844:AAFfMhSKBMunK68JkyogC5nKGL7vVGBhU3w";
 String chatID = "6148205976";
 
