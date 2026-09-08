@@ -1,0 +1,385 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <esp_system.h>
+
+// ==================== Configuração Wi-Fi e Telegram ====================
+const char* ssid = "aec10";
+const char* password = "";
+const char* botToken = "";
+String chatID = "6148205976";
+
+// ==================== Entradas digitais ====================
+const int entrada1 = 5;
+const int entrada2 = 4;
+const int entrada3 = 16;
+const int entrada4 = 17;
+
+// ==================== Saída digital ====================
+const int saidaGerador = 18;
+
+// ==================== Controle interno ====================
+int ultimoCodigoConfirmado = -1;
+int codigoAnteriorLeitura = -1;
+
+unsigned long tempoMudanca = 0;
+const unsigned long tempoEstabilizacao = 300;
+
+unsigned long ultimoEnvioTelegram = 0;
+const unsigned long tempoMinimoEntreEnvios = 500;
+
+bool geradorLigado = false;
+unsigned long tempoInicio = 0;
+
+// ==================== Controle Telegram ====================
+unsigned long ultimoCheckTelegram = 0;
+const unsigned long intervaloCheckTelegram = 3000;
+long lastUpdateId = 0;
+
+// ==================== Relatório diário em horário fixo ====================
+const int HORA_RELATORIO = 8;      // 0-23
+const int MINUTO_RELATORIO = 0;    // 0-59
+
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -3 * 3600;
+const int daylightOffset_sec = 0;
+
+bool relatorioEnviadoHoje = false;
+bool horaSincronizada = false;
+
+unsigned long tempoLigadoAcumuladoMs = 0;
+
+// ==================== [2] Reconexão automática de Wi-Fi ====================
+unsigned long ultimaTentativaReconexao = 0;
+const unsigned long intervaloReconexaoWifi = 10000; // tenta a cada 10s se cair
+bool avisouQuedaWifi = false;
+
+// ==================== [5] Ressincronização periódica do NTP ====================
+unsigned long ultimoResyncNTP = 0;
+const unsigned long intervaloResyncNTP = 6UL * 60UL * 60UL * 1000UL; // 6 horas
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(entrada1, INPUT_PULLUP);
+  pinMode(entrada2, INPUT_PULLUP);
+  pinMode(entrada3, INPUT_PULLUP);
+  pinMode(entrada4, INPUT_PULLUP);
+
+  pinMode(saidaGerador, OUTPUT);
+  digitalWrite(saidaGerador, LOW);
+
+  Serial.println("Sistema iniciado com filtro de estabilidade");
+
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando ao WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado!");
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.print("Sincronizando horario via NTP");
+  struct tm timeinfo;
+  int tentativas = 0;
+  while (!getLocalTime(&timeinfo) && tentativas < 20) {
+    Serial.print(".");
+    delay(500);
+    tentativas++;
+  }
+  if (getLocalTime(&timeinfo)) {
+    horaSincronizada = true;
+    Serial.println(&timeinfo, "\nHorario sincronizado: %d/%m/%Y %H:%M:%S");
+  } else {
+    Serial.println("\nNao foi possivel sincronizar o horario agora (vai tentar de novo em segundo plano).");
+  }
+  ultimoResyncNTP = millis();
+
+  // ==================== [1] Aviso de reinicialização com motivo ====================
+  String motivo = obterMotivoReset();
+  String msgBoot = "Sistema reiniciado.\nMotivo: " + motivo;
+  if (horaSincronizada) {
+    char horaTexto[20];
+    strftime(horaTexto, sizeof(horaTexto), "%d/%m %H:%M:%S", &timeinfo);
+    msgBoot += "\nHorario: " + String(horaTexto);
+  }
+  enviarMensagemTelegram(msgBoot);
+}
+
+void loop() {
+
+  verificarConexaoWifi();
+  verificarComandosTelegram();
+  verificarRelatorioDiario();
+  verificarResyncNTP();
+
+  // ==================== Leitura das entradas ====================
+  int e1 = !digitalRead(entrada1);
+  int e2 = !digitalRead(entrada2);
+  int e3 = !digitalRead(entrada3);
+  int e4 = !digitalRead(entrada4);
+
+  int codigoAtual = (e1 << 3) | (e2 << 2) | (e3 << 1) | e4;
+
+  if (codigoAtual != codigoAnteriorLeitura) {
+    tempoMudanca = millis();
+    codigoAnteriorLeitura = codigoAtual;
+  }
+
+  if ((millis() - tempoMudanca) > tempoEstabilizacao) {
+    if (codigoAtual != ultimoCodigoConfirmado) {
+
+      String estado = tabelaGerador(codigoAtual);
+
+      Serial.println(estado);
+
+      // ==================== Log tempo ligado ====================
+      if (e1 == 1 && !geradorLigado) {
+        geradorLigado = true;
+        tempoInicio = millis();
+      }
+      else if (e1 == 0 && geradorLigado) {
+        geradorLigado = false;
+
+        unsigned long tempoLigadoMs = millis() - tempoInicio;
+        tempoLigadoAcumuladoMs += tempoLigadoMs;
+
+        unsigned long totalMinutos = tempoLigadoMs / 60000;
+        unsigned long horas = totalMinutos / 60;
+        unsigned long minutos = totalMinutos % 60;
+
+        String mensagemTempo = "Gerador ficou ligado por ";
+        if (horas > 0) mensagemTempo += String(horas) + " h ";
+        mensagemTempo += String(minutos) + " min";
+
+        enviarMensagemTelegram(mensagemTempo);
+      }
+
+      // Envio de estado
+      if (millis() - ultimoEnvioTelegram > tempoMinimoEntreEnvios) {
+        enviarMensagemTelegram(estado);
+        ultimoEnvioTelegram = millis();
+      }
+
+      ultimoCodigoConfirmado = codigoAtual;
+    }
+  }
+}
+
+// ==================== [2] Reconexão automática de Wi-Fi ====================
+// Se a conexão cair, tenta reconectar sozinho a cada 10s, sem travar o loop
+// com delay(). Avisa uma vez quando cai e uma vez quando volta.
+void verificarConexaoWifi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (avisouQuedaWifi) {
+      Serial.println("WiFi reconectado.");
+      enviarMensagemTelegram("WiFi reconectado.");
+      avisouQuedaWifi = false;
+    }
+    return;
+  }
+
+  if (!avisouQuedaWifi) {
+    Serial.println("WiFi caiu! Vai tentar reconectar automaticamente.");
+    avisouQuedaWifi = true;
+    // Não envia Telegram aqui pois sem WiFi não tem como mandar mesmo.
+  }
+
+  if (millis() - ultimaTentativaReconexao > intervaloReconexaoWifi) {
+    ultimaTentativaReconexao = millis();
+    Serial.println("Tentando reconectar ao WiFi...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+  }
+}
+
+// ==================== [5] Ressincronização periódica do NTP ====================
+// O relógio interno do ESP32 pode desviar ao longo de dias/semanas.
+// Isso ressincroniza de tempos em tempos sem bloquear o loop.
+void verificarResyncNTP() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - ultimoResyncNTP < intervaloResyncNTP) return;
+
+  ultimoResyncNTP = millis();
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    horaSincronizada = true;
+    Serial.println(&timeinfo, "Horario ressincronizado: %d/%m/%Y %H:%M:%S");
+  } else {
+    Serial.println("Falha ao ressincronizar horario via NTP.");
+  }
+}
+
+// ==================== Motivo do reset (usado no aviso de boot) ====================
+String obterMotivoReset() {
+  esp_reset_reason_t motivo = esp_reset_reason();
+  switch (motivo) {
+    case ESP_RST_POWERON:   return "Ligado na tomada / energia (power-on)";
+    case ESP_RST_EXT:       return "Reset externo (botao ou pino EN)";
+    case ESP_RST_SW:        return "Reset por software";
+    case ESP_RST_PANIC:     return "Crash / excecao no programa (panic)";
+    case ESP_RST_INT_WDT:   return "Watchdog interno";
+    case ESP_RST_TASK_WDT:  return "Watchdog de tarefa (loop travou)";
+    case ESP_RST_WDT:       return "Outro watchdog";
+    case ESP_RST_DEEPSLEEP: return "Saiu de deep sleep";
+    case ESP_RST_BROWNOUT:  return "Brownout (queda de tensao/energia instavel)";
+    case ESP_RST_SDIO:      return "Reset via SDIO";
+    default:                return "Desconhecido";
+  }
+}
+
+// ==================== Relatório diário automático ====================
+void verificarRelatorioDiario() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return;
+  }
+  horaSincronizada = true;
+
+  if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0) {
+    relatorioEnviadoHoje = false;
+  }
+
+  if (timeinfo.tm_hour == HORA_RELATORIO &&
+      timeinfo.tm_min == MINUTO_RELATORIO &&
+      !relatorioEnviadoHoje) {
+    enviarRelatorioDiario();
+    relatorioEnviadoHoje = true;
+  }
+}
+
+void enviarRelatorioDiario() {
+  String estadoAtual = tabelaGerador(ultimoCodigoConfirmado);
+
+  unsigned long tempoTotalMs = tempoLigadoAcumuladoMs;
+  if (geradorLigado) {
+    tempoTotalMs += millis() - tempoInicio;
+  }
+
+  unsigned long totalMinutos = tempoTotalMs / 60000;
+  unsigned long horas = totalMinutos / 60;
+  unsigned long minutos = totalMinutos % 60;
+
+  char horarioFormatado[6];
+  snprintf(horarioFormatado, sizeof(horarioFormatado), "%02d:%02d", HORA_RELATORIO, MINUTO_RELATORIO);
+
+  String msg = "Relatorio diario (" + String(horarioFormatado) + ")\n";
+  msg += "Sistema online e funcionando.\n";
+  msg += "Estado atual: " + estadoAtual + "\n";
+  msg += "Tempo ligado desde o ultimo relatorio: ";
+  if (horas > 0) msg += String(horas) + "h ";
+  msg += String(minutos) + "min\n";
+
+  // [7] Força do sinal Wi-Fi
+  msg += "Sinal WiFi: " + String(WiFi.RSSI()) + " dBm\n";
+  // [8] Memória livre (heap)
+  msg += "Memoria livre: " + String(ESP.getFreeHeap()) + " bytes";
+
+  enviarMensagemTelegram(msg);
+
+  tempoLigadoAcumuladoMs = 0;
+  if (geradorLigado) tempoInicio = millis();
+}
+
+// ==================== Verificação comandos Telegram ====================
+void verificarComandosTelegram() {
+
+  if (millis() - ultimoCheckTelegram < intervaloCheckTelegram) return;
+  ultimoCheckTelegram = millis();
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + String(botToken) +
+               "/getUpdates?offset=" + String(lastUpdateId + 1);
+  http.begin(url);
+
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+
+    DynamicJsonDocument doc(4096);
+    deserializeJson(doc, payload);
+
+    JsonArray results = doc["result"];
+
+    for (JsonObject obj : results) {
+
+      lastUpdateId = obj["update_id"].as<long>();
+
+      if (!obj["message"]["text"]) continue;
+
+      String mensagem = obj["message"]["text"].as<String>();
+      mensagem.trim();
+
+      if (mensagem == "Ligar gerador") {
+        digitalWrite(saidaGerador, HIGH);
+        enviarMensagemTelegram("Saida do gerador acionada.");
+      }
+
+      else if (mensagem == "Desligar gerador") {
+        digitalWrite(saidaGerador, LOW);
+        enviarMensagemTelegram("Saida do gerador desligada.");
+      }
+
+      else if (mensagem == "Relatorio") {
+        enviarRelatorioDiario();
+      }
+    }
+  }
+
+  http.end();
+}
+
+// ==================== Envio Telegram ====================
+void enviarMensagemTelegram(String mensagem) {
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + String(botToken) + "/sendMessage";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData = "chat_id=" + chatID + "&text=" + mensagem;
+  http.POST(postData);
+
+  http.end();
+}
+
+// ==================== Tabela lógica ORIGINAL COMPLETA ====================
+String tabelaGerador(int codigo) {
+
+  switch(codigo) {
+
+    case 0b0000: return "Gerador desligado - QTA posicao 0";
+    case 0b0001: return "Gerador desligado - QTA posicao II";
+    case 0b0010: return "Gerador desligado - QTA posicao I";
+    case 0b0011: return "Nao aplicado";
+
+    case 0b0100: return "Gerador em falha - QTA posicao 0";
+    case 0b0101: return "Gerador em falha - QTA posicao II";
+    case 0b0110: return "Gerador em falha - QTA posicao I";
+    case 0b0111: return "Nao aplicado";
+
+    case 0b1000: return "Gerador ligado - QTA posicao 0";
+    case 0b1001: return "Gerador ligado - QTA posicao II";
+    case 0b1010: return "Gerador ligado - QTA posicao I";
+    case 0b1011: return "Nao aplicado";
+
+    case 0b1100: return "Gerador em alerta - QTA posicao 0";
+    case 0b1101: return "Gerador em alerta - QTA posicao II";
+    case 0b1110: return "Gerador em alerta - QTA posicao I";
+    case 0b1111: return "Nao aplicado";
+
+    default: return "Estado desconhecido";
+  }
+}
