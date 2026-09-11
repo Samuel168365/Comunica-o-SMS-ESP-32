@@ -4,7 +4,7 @@
 
 // ===== CONFIGURAÇÃO WIFI =====
 #define WIFI_SSID       "aec10"
-#define WIFI_PASSWORD   "4Tyv!/.s"
+#define WIFI_PASSWORD   ""
 
 // ===== CONFIGURAÇÃO GMAIL =====
 #define SMTP_HOST       "smtp.gmail.com"
